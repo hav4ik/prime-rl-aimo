@@ -27,6 +27,7 @@ from prime_rl.inference.patches import (
     monkey_patch_strip_routed_experts_from_chat,
     monkey_patch_tokenize_params_validation,
     monkey_patch_vllm_padded_input_scrub,
+    register_olmo3_sink_model,
 )
 
 # NOTE: Fix harmony stop token propagation for GPT-OSS models
@@ -54,6 +55,8 @@ monkey_patch_strip_routed_experts_from_chat()
 # API server blows through when all engine-core ranks on the node are loading
 # weights concurrently (multi-node disaggregated deployments).
 monkey_patch_dp_coordinator_startup_timeout()
+# NOTE: Register OLMo3Sink before vLLM inspects checkpoint architectures.
+register_olmo3_sink_model()
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 

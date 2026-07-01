@@ -19,11 +19,17 @@ from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput, cast_float_and
 from prime_rl.trainer.models.llama import LlamaForCausalLM
 from prime_rl.trainer.models.minimax_m2 import MiniMaxM2Config, MiniMaxM2ForCausalLM
 from prime_rl.trainer.models.nemotron_h import NemotronHConfig, NemotronHForCausalLM
+from prime_rl.trainer.models.olmo3_sink import (
+    Olmo3SinkConfig,
+    Olmo3SinkForCausalLM,
+    register_olmo3_sink,
+)
 from prime_rl.trainer.models.qwen3 import Qwen3ForCausalLM
 from prime_rl.trainer.models.qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM
 from prime_rl.trainer.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 # Make custom config discoverable by AutoConfig
+register_olmo3_sink()
 AutoConfig.register("afmoe", AfmoeConfig, exist_ok=True)
 AutoConfig.register("glm4_moe", Glm4MoeConfig, exist_ok=True)
 AutoConfig.register("glm_moe_dsa", GlmMoeDsaConfig, exist_ok=True)
@@ -46,6 +52,9 @@ _CUSTOM_CAUSAL_LM_MAPPING.register(NemotronHConfig, NemotronHForCausalLM, exist_
 _CUSTOM_CAUSAL_LM_MAPPING.register(Qwen3MoeConfig, Qwen3MoeForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(GptOssConfig, GptOssForCausalLM, exist_ok=True)
+# Olmo3Sink intentionally stays out of the PrimeRL custom mapping for now.
+# It loads through the Hugging Face path, while vLLM uses the adapter registered
+# from prime_rl.inference.patches.
 
 
 class AutoModelForCausalLMPrimeRL(_BaseAutoModelClass):
@@ -82,7 +91,10 @@ def get_custom_vlm_cls(model_config: PretrainedConfig) -> type | None:
 
 __all__ = [
     "AutoModelForCausalLMPrimeRL",
+    "Olmo3SinkConfig",
+    "Olmo3SinkForCausalLM",
     "PreTrainedModelPrimeRL",
+    "register_olmo3_sink",
     "supports_custom_impl",
     "get_custom_vlm_cls",
     "PrimeLmOutput",

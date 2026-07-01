@@ -7,10 +7,14 @@ from prime_rl.inference.patches import (
     monkey_patch_minimax_m2_for_lora,
     monkey_patch_no_moe_lora,
     monkey_patch_skip_lora_module_warnings,
+    register_olmo3_sink_model,
 )
 
 logger = logging.getLogger(__name__)
 
+# Register OLMo3Sink in worker-extension processes as well as API-server
+# processes. This is idempotent and safe when no OLMo3Sink model is used.
+register_olmo3_sink_model()
 # Monkeypatch LRUCacheWorkerLoRAManager to allow loading adapter inplace without doing it every request
 monkey_patch_LRUCacheWorkerLoRAManager()
 # Skip the per-module regex warning loop in WorkerLoRAManager._load_adapter

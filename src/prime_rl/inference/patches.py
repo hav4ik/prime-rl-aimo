@@ -1,6 +1,11 @@
+import logging
+
 import torch
 
 from prime_rl.inference.vllm.padded_input_scrub import monkey_patch_vllm_padded_input_scrub
+
+logger = logging.getLogger(__name__)
+_OLMO3_SINK_VLLM_REGISTERED = False
 
 
 def transformers_v5_compat():
@@ -20,6 +25,31 @@ def transformers_v5_compat():
     monkey_patch_vllm_padded_input_scrub()
     monkey_patch_return_routed_experts_with_nixl_connector()
     monkey_patch_kv_xfer_finished_tolerate_freed()
+    register_olmo3_sink_model()
+
+
+def register_olmo3_sink_model() -> None:
+    """Register OLMo3Sink for Transformers and vLLM rollout workers."""
+    global _OLMO3_SINK_VLLM_REGISTERED
+    if _OLMO3_SINK_VLLM_REGISTERED:
+        return
+
+    from prime_rl.trainer.models.olmo3_sink import register_olmo3_sink
+
+    register_olmo3_sink()
+
+    try:
+        from vllm import ModelRegistry
+    except Exception as exc:
+        logger.warning("vLLM is not importable; skipped OLMo3Sink vLLM registration: %s", exc)
+        return
+
+    ModelRegistry.register_model(
+        "Olmo3SinkForCausalLM",
+        "prime_rl.trainer.models.olmo3_sink.vllm_adapter:Olmo3SinkForCausalLM",
+    )
+    _OLMO3_SINK_VLLM_REGISTERED = True
+    logger.info("Registered Olmo3SinkForCausalLM for vLLM.")
 
 
 def monkey_patch_kv_xfer_finished_tolerate_freed():
