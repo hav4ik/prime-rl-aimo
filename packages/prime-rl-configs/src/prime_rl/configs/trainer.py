@@ -364,7 +364,7 @@ class TransformerEngineFusedAdamWConfig(BaseOptimizerConfig):
     master_weights: bool = False
     """Keep optimizer master weights."""
 
-    master_weight_dtype: Literal["float32", "bfloat16"] = "float32"
+    master_weight_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     """Transformer Engine master weight dtype."""
 
     exp_avg_dtype: Literal["float32", "bfloat16"] = "bfloat16"
