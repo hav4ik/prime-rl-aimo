@@ -225,6 +225,8 @@ def _create_optimizer(
                 weight_decay=config.weight_decay,
                 betas=(config.betas1, config.betas2),
             )
+        case "te_fused_adamw":
+            return _create_te_fused_adamw_optimizer(config, trainable_params, lr)
         case "muon":
             return _create_muon_optimizer(config, named_params, parallel_dims, lr)
         case "sign_sgd":
@@ -233,6 +235,45 @@ def _create_optimizer(
                 lr=lr,
                 weight_decay=config.weight_decay,
             )
+
+
+def _te_optimizer_dtype(value: str | torch.dtype) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
+    return getattr(torch, value.lower())
+
+
+def _create_te_fused_adamw_optimizer(
+    config: OptimizerConfig,
+    params: list[nn.Parameter],
+    lr: float,
+) -> Optimizer:
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam
+    except Exception as exc:
+        raise ImportError(
+            "Optimizer type 'te_fused_adamw' requires "
+            "transformer_engine.pytorch.optimizers.FusedAdam."
+        ) from exc
+
+    get_logger().warning(
+        "Using Transformer Engine FusedAdamW optimizer with "
+        f"exp_avg_dtype={config.exp_avg_dtype} exp_avg_sq_dtype={config.exp_avg_sq_dtype}."
+    )
+    return FusedAdam(
+        params,
+        lr=lr,
+        weight_decay=config.weight_decay,
+        betas=(config.betas1, config.betas2),
+        eps=config.eps,
+        bias_correction=config.bias_correction,
+        adam_w_mode=True,
+        master_weights=config.master_weights,
+        master_weight_dtype=_te_optimizer_dtype(config.master_weight_dtype),
+        exp_avg_dtype=_te_optimizer_dtype(config.exp_avg_dtype),
+        exp_avg_sq_dtype=_te_optimizer_dtype(config.exp_avg_sq_dtype),
+        store_param_remainders=config.store_param_remainders,
+    )
 
 
 def _create_muon_optimizer(

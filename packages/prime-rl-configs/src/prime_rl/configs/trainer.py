@@ -346,6 +346,37 @@ class AdamWConfig(BaseOptimizerConfig):
     """Adam second-moment (β2) decay."""
 
 
+class TransformerEngineFusedAdamWConfig(BaseOptimizerConfig):
+    type: Literal["te_fused_adamw"] = "te_fused_adamw"
+
+    betas1: float = Field(0.9, ge=0)
+    """Adam first-moment (β1) decay."""
+
+    betas2: float = Field(0.999, ge=0)
+    """Adam second-moment (β2) decay."""
+
+    eps: float = Field(1e-8, ge=0)
+    """Adam epsilon."""
+
+    bias_correction: bool = True
+    """Apply Adam bias correction."""
+
+    master_weights: bool = False
+    """Keep optimizer master weights."""
+
+    master_weight_dtype: Literal["float32", "bfloat16"] = "float32"
+    """Transformer Engine master weight dtype."""
+
+    exp_avg_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    """Transformer Engine first-moment state dtype."""
+
+    exp_avg_sq_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    """Transformer Engine second-moment state dtype."""
+
+    store_param_remainders: bool = False
+    """Store parameter remainders for low-precision optimizer state."""
+
+
 class MuonConfig(BaseOptimizerConfig):
     type: Literal["muon"] = "muon"
 
@@ -364,7 +395,8 @@ class SignSGDConfig(BaseOptimizerConfig):
 
 
 OptimizerConfig: TypeAlias = Annotated[
-    SGDConfig | AdamWConfig | MuonConfig | SignSGDConfig, Field(discriminator="type")
+    SGDConfig | AdamWConfig | TransformerEngineFusedAdamWConfig | MuonConfig | SignSGDConfig,
+    Field(discriminator="type"),
 ]
 
 
