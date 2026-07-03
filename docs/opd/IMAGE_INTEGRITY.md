@@ -105,23 +105,24 @@ NII mounts the team's data storage at `/tmp` (so `/tmp` is **not** empty). Nothi
 
 ---
 
-## 8. Adversarial audit (round 2, vLLM 0.24 bump)
+## 8. Adversarial audit
 
-Five parallel adversarial sub-agents re-audited the image + branch, each mandated to break a
-specific claim against the real image/repo. Real issues found and **fixed**:
-- **Overlay base/lock skew (CRITICAL).** `primeintellect/prime-rl:main` still ships vLLM **0.23**
-  while the lock now pins **0.24**; overlaying current code onto it silently de-registers olmo3_sink
-  (the vLLM plugin hard-imports 0.24-only `vllm.parser.*`, and vLLM swallows plugin-load failures).
-  → a build-time **overlay-consistency guard** now fails the build unless `base vLLM == lock vLLM`.
-  **Do not rebuild `chankhavu/aimo-opd:v1` until the base republishes at 0.24** (verify: `docker run
-  --rm --entrypoint /app/.venv/bin/python primeintellect/prime-rl:main -c "import vllm;print(vllm.__version__)"`).
-- **`CUDA_HOME` host-nvcc bypass (HIGH).** Fixed per §5 (bind-safe `/opt/opd/cuda`).
-- **cutlass cache leak (MED).** Fixed per §6 (`CUTE_DSL_CACHE_DIR`).
+Two rounds of parallel adversarial sub-agents audited the image + `dev` branch against the real
+image/repo (GPU tests, real container builds). **Full findings, root causes, and the action plan
+are in `AUDIT.md`.** Headlines:
+- **CRITICAL (pending): `worker/__init__.py` ImportErrors the rollout worker** — a bad-merge on
+  `main` kept two LoRA-monkeypatch calls that upstream deleted for vLLM 0.24, breaking olmo3_sink
+  registration in every vLLM worker, on any version. See AUDIT §A.
+- **vLLM 0.24 upgrade (pending):** the base image lags at 0.23; the validated path is
+  `uv sync --locked --no-dev` (copy full workspace incl `deps/`, sync before deep-gemm; this
+  replaces the round-2 overlay-guard). See AUDIT §B.
+- **Fixed round-2:** the `CUDA_HOME` host-nvcc bypass (§5), the cutlass cache leak (§6), the
+  build-file version-control gap, and a round-1 `ptxas` PATH hole.
 
 Verified **clean**: sink gradients (fp64 brute-force, 9 regimes — a missing-α bug would show
-40–130% error; kernel sits at bf16 noise), rebase/dev-branch integrity (`range-diff` identical),
-fork ≡ upstream `pyproject.toml`+`uv.lock` (identical blob hashes). The already-built `v1` image is
-internally consistent (frozen on 0.23-aligned code + 0.23 venv) and works.
+40–130% error; the kernel sits at bf16 noise), rebase/dev-branch integrity (`range-diff` identical),
+fork ≡ upstream `pyproject.toml`+`uv.lock` (identical blob hashes). The `olmo3_sink` vLLM integration
+is **model registration on vLLM's native `Attention(sinks=)`, not a sink patch**.
 
 ---
 
