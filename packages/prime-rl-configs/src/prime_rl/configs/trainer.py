@@ -25,6 +25,7 @@ AttnImplementation: TypeAlias = Literal[
     "flash_attention_3",
     "fa4",
     "olmo3_sink_fa3",
+    "olmo3_sink_fa2",
 ]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
