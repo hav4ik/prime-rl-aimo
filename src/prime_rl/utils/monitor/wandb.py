@@ -38,6 +38,43 @@ def _loggable_task(task) -> str:
     return json.dumps(elide(task.model_dump(mode="json")))
 
 
+def _json_table_cell(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def _proof_opd_trace(rollout) -> dict[str, Any]:
+    info = getattr(rollout, "info", None)
+    if not isinstance(info, dict):
+        return {}
+    trace = info.get("proof_opd_trace")
+    return trace if isinstance(trace, dict) else {}
+
+
+def _sample_proof_opd_rollouts(rollouts: list, default_sampled: list) -> list:
+    if os.environ.get("PRIME_WANDB_LOG_PROOF_OPD_TRACES", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return default_sampled
+    proof_rollouts = [rollout for rollout in rollouts if _proof_opd_trace(rollout)]
+    if not proof_rollouts:
+        return default_sampled
+    limit_text = os.environ.get("PRIME_WANDB_PROOF_OPD_TRACE_LIMIT", "64").strip()
+    try:
+        limit = int(limit_text)
+    except ValueError:
+        limit = 64
+    if limit > 0:
+        proof_rollouts = proof_rollouts[:limit]
+    seen = {id(rollout) for rollout in default_sampled}
+    merged = list(default_sampled)
+    for rollout in proof_rollouts:
+        if id(rollout) not in seen:
+            merged.append(rollout)
+            seen.add(id(rollout))
+    return merged
+
+
 class WandbMonitor(Monitor):
     """Logs to Weights and Biases."""
 
@@ -133,7 +170,21 @@ class WandbMonitor(Monitor):
         if config is not None and isinstance(config, WandbWithExtrasConfig) and config.log_extras:
             if config.log_extras.samples:
                 self.last_log_samples_step = -1
-                self.samples_cols = ["step", "env_name", "task", "task_idx", "messages", "input_ids", "reward"]
+                self.samples_cols = [
+                    "step",
+                    "env_name",
+                    "task",
+                    "task_idx",
+                    "messages",
+                    "input_ids",
+                    "reward",
+                    "task_type",
+                    "gold_answer",
+                    "boxed_answer",
+                    "verifiable_accuracy",
+                    "answer_match_method",
+                    "proof_opd_trace",
+                ]
                 self.samples_table = wandb.Table(
                     columns=self.samples_cols,
                     log_mode="INCREMENTAL",
@@ -167,20 +218,27 @@ class WandbMonitor(Monitor):
         """Logs rollouts to W&B table."""
         if not self.is_master:
             return
+        has_proof_opd_traces = any(_proof_opd_trace(rollout) for rollout in rollouts)
+        force_proof_opd_trace_log = (
+            has_proof_opd_traces
+            and os.environ.get("PRIME_WANDB_LOG_PROOF_OPD_TRACES", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
         if (
             not self.config
             or not isinstance(self.config, WandbWithExtrasConfig)
             or not self.config.log_extras
             or not self.config.log_extras.samples
-            or step % self.config.log_extras.interval != 0
+            or (step % self.config.log_extras.interval != 0 and not force_proof_opd_trace_log)
         ):
             # Do not log samples if not enabled or not log interval step
             return
 
-        rollouts = sample_items_for_logging(
+        sampled_rollouts = sample_items_for_logging(
             rollouts,
             self.config.log_extras.sample_ratio,
         )
+        rollouts = _sample_proof_opd_rollouts(rollouts, sampled_rollouts)
         if not rollouts:
             return
 
@@ -197,6 +255,7 @@ class WandbMonitor(Monitor):
                 token_ids = branch.token_ids
                 if not token_ids:
                     continue
+                proof_trace = _proof_opd_trace(rollout)
                 sample = {
                     "step": step,
                     "env_name": rollout.env_name,
@@ -205,6 +264,12 @@ class WandbMonitor(Monitor):
                     "messages": self.tokenizer.decode(token_ids),
                     "input_ids": str(token_ids),
                     "reward": trace.reward,
+                    "task_type": proof_trace.get("task_type", ""),
+                    "gold_answer": proof_trace.get("gold_answer", ""),
+                    "boxed_answer": proof_trace.get("boxed_answer", ""),
+                    "verifiable_accuracy": proof_trace.get("verifiable_accuracy", ""),
+                    "answer_match_method": proof_trace.get("answer_match_method", ""),
+                    "proof_opd_trace": _json_table_cell(proof_trace) if proof_trace else "",
                 }
                 assert list(sample.keys()) == self.samples_cols, (
                     "Order of columns in the table must be the same as order of the keys here"
