@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+# Patched in-kernel FA3 sink for sm_90 (Hopper / H200), layered onto the OPD image.
+#
+# Builds flash-attention `hopper/` from source with Yi-Chia Chen's fa3_attention_sink.patch,
+# directly on the OPD base — which already ships nvcc 12.8, CUDA headers, gcc/g++, and the
+# exact torch (2.11.0+cu128). So no cudnn-devel base pull and no torch re-download; only the
+# flash-attention + cutlass clone and the ~1 h compile. Once the patched wheel replaces stock
+# flash_attn_3, `_fa3_fwd_accepts_sink()` flips to True and the trainer uses the in-kernel sink.
+#
+# sm_90 ONLY: the patch edits the Hopper mainloop (mainloop_fwd_sm90_tma_gmma_ws.hpp). Do NOT
+# run this image on Blackwell (sm_100/sm_120) — the op would advertise the sink arg but the
+# kernel ignores it => silently sink-free. Blackwell uses the fork's fallback (no patched wheel).
+#
+# Build:
+#   docker build -f Dockerfile.fa3 --build-arg OPD_BASE=chankhavu/aimo-opd:v1 -t chankhavu/aimo-opd:v1-fa3 .
+ARG OPD_BASE=chankhavu/aimo-opd:v1
+FROM ${OPD_BASE}
+
+ARG FA_REF=73c992c8ca746935548df620ef3c1b6238fe6e68
+ENV CUDA_HOME=/usr/local/cuda \
+    FLASH_ATTENTION_DISABLE_SM80=TRUE \
+    FLASH_ATTENTION_DISABLE_FP16=TRUE \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    MAX_JOBS=8
+
+# Build deps into the OPD venv (torch/setuptools already present; these are tiny).
+RUN uv pip install --python /app/.venv/bin/python --no-cache-dir ninja packaging psutil wheel
+
+# Clone at the pinned sha, apply Yi-Chia's patch, build the hopper wheel against the base's torch.
+COPY --chown=appuser:appuser src/prime_rl/trainer/models/olmo3_sink/fa3_attention_sink.patch /tmp/fa3.patch
+RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/fa \
+ && cd /tmp/fa && git checkout "${FA_REF}" \
+ && git submodule update --init --depth 1 \
+ && git apply --verbose /tmp/fa3.patch \
+ # assert the op-schema patch is in the source before compiling:
+ && grep -q 'Tensor? sink = None' hopper/flash_api.cpp && echo "SOURCE OK: fwd schema has sink" \
+ && cd hopper \
+ && /app/.venv/bin/python setup.py bdist_wheel \
+ # assert the COMPILED .so carries the sink schema (else the build downloaded a prebuilt wheel):
+ && so=$(find build -name '_C*.so' | head -1) && echo "built .so: $so" \
+ && (strings "$so" | grep -q 'Tensor? sink = None' && echo "COMPILED OK: .so has sink schema" \
+     || (echo "FAIL: compiled .so lacks sink schema"; exit 1)) \
+ && ls -lh dist/
+
+# Replace stock flash_attn_3 with the patched build (same torch.ops.flash_attn_3 lib; uninstall
+# first to avoid double registration). Install from /tmp (not /app) so uv does NOT pick up the
+# project's [tool.uv.extra-build-dependencies] (flash-attn-3 -> torch match-runtime), which
+# errors on a plain wheel install.
+RUN mkdir -p /tmp/whl && cp /tmp/fa/hopper/dist/*.whl /tmp/whl/ && rm -rf /tmp/fa && cd /tmp/whl \
+ && (uv pip uninstall --python /app/.venv/bin/python flash_attn_3 flashattn-hopper 2>/dev/null || true) \
+ && uv pip install --python /app/.venv/bin/python --no-cache-dir --no-deps /tmp/whl/*.whl \
+ && rm -rf /tmp/whl /tmp/fa3.patch
+
+# Best-effort build-time check (op may defer load without a GPU); real check is on Hopper.
+RUN /app/.venv/bin/python -c "import torch, flash_attn_interface; print('patched FA3 sink arg present:', 'sink' in str(torch.ops.flash_attn_3.fwd._schemas))" \
+    || echo "verify on Hopper at runtime (op load deferred without a GPU)"

@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1
+# AIMO OPD image = prime-rl (OPD) + a separate uv venv for OLMo-core SFT (phase-1).
+#
+# Two isolated uv venvs in one image so their transformers pins never collide:
+#   /app/.venv       prime-rl OPD   torch 2.11+cu128 · vLLM 0.23 · transformers 5.6.2  (from Dockerfile.cuda)
+#   /opt/olmo/.venv  OLMo-core SFT  torch 2.11+cu128 · TE 2.9 · FA2/FA3 · transformers 5.x  (this file)
+#
+# prime-rl already lives in a uv venv (Dockerfile.cuda sets UV_PROJECT_ENVIRONMENT=/app/.venv);
+# this file only adds the second venv beside it — nothing about the prime-rl venv changes.
+#
+# Build order (the base is this fork's own prime-rl image):
+#   docker build -f Dockerfile.cuda -t prime-rl-aimo:local .
+#   docker build -f Dockerfile.opd  --build-arg PRIME_RL_BASE=prime-rl-aimo:local -t aimo-opd:local .
+
+ARG PRIME_RL_BASE=prime-rl-aimo:local
+# Same devel base/CUDA as Dockerfile.cuda's builder, so TE compiles against the
+# CUDA 12.8 toolkit the runtime image ships.
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+
+# ---------------------------------------------------------------------------
+# Stage 1 — build the OLMo-core venv (TransformerEngine compiles => needs nvcc).
+# ---------------------------------------------------------------------------
+FROM ${CUDA_DEVEL_IMAGE} AS olmo-builder
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
+    UV_PYTHON_PREFERENCE=only-system \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git ninja-build \
+        python3.12 python3.12-dev python3.12-venv \
+ && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+ && rm -rf /var/lib/apt/lists/*
+
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/usr/local/bin sh /uv-installer.sh && rm /uv-installer.sh
+
+# Recipe knobs (mirror sft-images/aimo-olmo3-sft, retargeted to torch 2.11 / sm_90).
+ARG OLMO_CORE_REPO=https://github.com/hav4ik/OLMo-core.git
+ARG OLMO_CORE_REF=olmo3-sft
+ARG TORCH_VERSION=2.11.0
+ARG TE_VERSION=2.9
+# Target GPU arch for the source-compiled TransformerEngine (build box arch is
+# irrelevant). Default Hopper/H200; set "90;100" to also cover B200.
+ARG NVTE_CUDA_ARCHS=90
+ENV OLMO_VENV=/opt/olmo/.venv
+COPY scripts/install_olmo_core_venv.sh /tmp/install_olmo_core_venv.sh
+RUN OLMO_CORE_REPO="${OLMO_CORE_REPO}" OLMO_CORE_REF="${OLMO_CORE_REF}" \
+    TORCH_VERSION="${TORCH_VERSION}" TE_VERSION="${TE_VERSION}" \
+    NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" \
+    bash /tmp/install_olmo_core_venv.sh
+
+# ---------------------------------------------------------------------------
+# Stage 2 — final image = prime-rl base + the OLMo-core venv copied in.
+# ---------------------------------------------------------------------------
+FROM ${PRIME_RL_BASE} AS final
+# The OLMo-core venv is self-contained (torch wheels bundle their CUDA userspace);
+# both stages are ubuntu24.04 + system python3.12, so the venv relocates cleanly —
+# same pattern Dockerfile.cuda uses to copy /app/.venv out of its builder.
+COPY --from=olmo-builder /opt/olmo /opt/olmo
+COPY --from=olmo-builder /opt/OLMo-core /opt/OLMo-core
+
+# prime-rl stays the default environment (/app/.venv on PATH, its entrypoint unchanged).
+# OLMo-core SFT jobs run explicitly against the second venv, e.g.:
+#   /opt/olmo/.venv/bin/python -m olmo_core.launch ...
+ENV OLMO_VENV=/opt/olmo/.venv
+
+# --- Immutable-FS hardening: deployment guarantees ONLY /tmp and $HOME are writable. ---
+# Point every JIT/compile/scratch cache that would otherwise land on the read-only
+# rootfs (or on CWD=/app, e.g. wandb) at /tmp — node-local, always writable, and the
+# caches are small + regenerable. HF_HOME / TORCH_HOME keep their $HOME/.cache defaults
+# (writable per the guarantee, and better sized for large model downloads); override
+# HF_HOME to a bound data volume for real runs.
+ENV TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
+    TRITON_CACHE_DIR=/tmp/triton \
+    FLASHINFER_CACHE_DIR=/tmp/flashinfer \
+    VLLM_CACHE_ROOT=/tmp/vllm \
+    TILELANG_CACHE_DIR=/tmp/tilelang \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    CUDA_CACHE_PATH=/tmp/nv_compute_cache \
+    WANDB_DIR=/tmp/wandb \
+    WANDB_CACHE_DIR=/tmp/wandb_cache \
+    DG_JIT_CACHE_DIR=/tmp/deep_gemm
+
+# --- Optional FP8 (deep-gemm) for the blockwise-FP8 training/inference path. ---
+# Off by default (BF16 image). deep-gemm is a prebuilt wheel (no compile); the cu13
+# runtime libs it dlopens at JIT time are already baked by the prime-rl base, and its
+# JIT cache is DG_JIT_CACHE_DIR=/tmp/deep_gemm (writable). Enable with
+# --build-arg INSTALL_FP8=1. FP8 is still gated at runtime by config (trainer
+# `fp8=true`, inference `use_deep_gemm=true`) — installing the wheel only makes it available.
+ARG INSTALL_FP8=0
+ARG DEEP_GEMM_WHEEL=https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_gemm-2.5.0+891d57b-cp312-cp312-linux_x86_64.whl
+RUN if [ "$INSTALL_FP8" = "1" ]; then \
+        uv pip install --python /app/.venv/bin/python --no-cache-dir "${DEEP_GEMM_WHEEL}"; \
+        # import may probe CUDA; docker build has no GPU, so don't gate the build on it.
+        /app/.venv/bin/python -c "import deep_gemm; print('deep-gemm OK')" \
+            || echo "deep-gemm installed (import deferred: no GPU at build time)"; \
+    fi

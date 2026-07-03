@@ -1,0 +1,136 @@
+# v1 OPD image — thin overlay of this fork's prime_rl source on upstream prime-rl.
+#
+# The fork's pyproject.toml AND uv.lock are byte-identical to upstream main, so
+# primeintellect/prime-rl already contains this fork's exact venv (torch 2.11+cu128,
+# vLLM 0.23, transformers 5.6.2, stock flash-attn-3). The ONLY difference is this
+# fork's Python source (olmo3_sink model, TE FusedAdamW, Muon, …). So we don't build
+# from scratch — we overlay ~2 MB of Python onto the prebuilt base.
+#
+# prime_rl is a namespace package spanning two editable trees (verified in the base):
+#   prime_rl.__path__ = ['/app/src/prime_rl', '/app/packages/prime-rl-configs/src/prime_rl']
+# Overlaying those exact paths makes new files (olmo3_sink) discoverable and overrides
+# changed ones (configs/trainer.py) with no reinstall.
+#
+# Build (base is pulled locally, so this is fast — only the overlay layer is new):
+#   docker build -f Dockerfile.opd -t chankhavu/aimo-opd:v1 .
+#
+# SFT (OLMo-core venv) and FP8 (deep-gemm) are NOT here — see Dockerfile.opd-sft-full
+# + scripts/install_olmo_core_venv.sh. This image is dense-OLMo3-sink OPD on stock FA3.
+ARG PRIME_RL_BASE=primeintellect/prime-rl:main
+FROM ${PRIME_RL_BASE}
+
+# Run as root for the whole image. prime-rl's base defaults to the non-root `appuser`;
+# we override so nothing depends on a non-root uid or its permissions. Singularity
+# ignores USER anyway (runs as the invoking host user), so this only affects
+# Docker/VastAI — where root avoids /opt permission issues and keeps the build simple.
+USER root
+
+# Overlay the fork's prime_rl source into the base's editable namespace paths.
+COPY --chown=root:root src/prime_rl /app/src/prime_rl
+COPY --chown=root:root packages/prime-rl-configs/src/prime_rl/configs /app/packages/prime-rl-configs/src/prime_rl/configs
+
+# --- Overlay-consistency guard: base venv MUST match our lock ---
+# The overlay assumes the base image already contains our lock's venv. When upstream bumps a
+# pinned dep (e.g. vLLM 0.23->0.24) the published base image can LAG the lock. Overlaying newer
+# code onto a stale venv silently de-registers olmo3_sink: the vLLM plugin hard-imports
+# version-specific modules (vllm.parser.*) and vLLM SWALLOWS plugin-load failures, so rollout
+# dies with "architecture Olmo3SinkForCausalLM not registered" and nothing errors at build time.
+# Fail LOUDLY here instead. If this trips, wait for primeintellect/prime-rl:main to republish at
+# the lock's vLLM, or pass --build-arg PRIME_RL_BASE=<a matching base>.
+COPY uv.lock /tmp/uv.lock
+RUN set -e; \
+    EXP="$(/app/.venv/bin/python -c "import tomllib; d=tomllib.load(open('/tmp/uv.lock','rb')); print(next(p['version'] for p in d['package'] if p['name']=='vllm').split('+')[0])")"; \
+    GOT="$(/app/.venv/bin/python -c "import vllm; print(vllm.__version__.split('+')[0])")"; \
+    echo "overlay guard: base vLLM=$GOT, lock pins vLLM=$EXP"; \
+    if [ "$EXP" != "$GOT" ]; then \
+        echo "FATAL: base image vLLM ($GOT) != lock ($EXP)."; \
+        echo "Overlaying current code onto this stale base would silently de-register olmo3_sink."; \
+        echo "Rebuild once the base republishes at $EXP (verify: docker run --rm --entrypoint \\"; \
+        echo "  /app/.venv/bin/python primeintellect/prime-rl:main -c 'import vllm;print(vllm.__version__)')."; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/uv.lock
+
+# Immutable-FS hardening: NII deploys read-only except /tmp and $HOME. IMPORTANT: /tmp is NOT
+# empty on NII — the team's data storage is mounted there — so we never assume it is and keep
+# EVERY cache/JIT/scratch dir this container writes namespaced under ONE tidy umbrella:
+#   /tmp/imochallenge/cache/<tool>
+# Each tool mkdir's its own subdir on first use. Model caches (HF/torch) also live here: the
+# mounted /tmp storage has space (unlike a node-local tmpfs) and persists across runs, so JIT
+# kernels and downloaded weights are reused. Nothing is written to the read-only rootfs or CWD.
+ENV IMO_CACHE_ROOT=/tmp/imochallenge/cache
+ENV TORCHINDUCTOR_CACHE_DIR=${IMO_CACHE_ROOT}/torchinductor \
+    TRITON_CACHE_DIR=${IMO_CACHE_ROOT}/triton \
+    FLASHINFER_WORKSPACE_BASE=${IMO_CACHE_ROOT}/flashinfer \
+    VLLM_CACHE_ROOT=${IMO_CACHE_ROOT}/vllm \
+    TILELANG_CACHE_DIR=${IMO_CACHE_ROOT}/tilelang \
+    TORCH_EXTENSIONS_DIR=${IMO_CACHE_ROOT}/torch_extensions \
+    CUDA_CACHE_PATH=${IMO_CACHE_ROOT}/nv_compute \
+    DG_JIT_CACHE_DIR=${IMO_CACHE_ROOT}/deep_gemm \
+    XDG_CACHE_HOME=${IMO_CACHE_ROOT}/xdg \
+    HF_HOME=${IMO_CACHE_ROOT}/hf \
+    TORCH_HOME=${IMO_CACHE_ROOT}/torch \
+    WANDB_DIR=${IMO_CACHE_ROOT}/wandb \
+    WANDB_CACHE_DIR=${IMO_CACHE_ROOT}/wandb_cache \
+    CUTE_DSL_CACHE_DIR=${IMO_CACHE_ROOT}/cutlass
+
+# FP8 (deep-gemm) for the blockwise-FP8 trainer path (Float8BlockwiseLinear ->
+# deep_gemm.fp8_gemm_nt) and vLLM FP8 inference. Prebuilt wheel, no compile; the cu13
+# runtime libs it dlopens at JIT time are already in the base (/opt/cuda13, ldconfig'd).
+# On by default (the 4xH200 OPD layout runs FP8); build with --build-arg INSTALL_FP8=0
+# for a pure-BF16 image. deep-gemm JIT-compiles kernels at first use into
+# DG_JIT_CACHE_DIR=/tmp/deep_gemm (writable on the read-only NII rootfs). If NVCC JIT
+# ever complains about the cu13-wheel vs cu12.8-nvcc skew, set DG_JIT_USE_NVRTC=1 at
+# runtime to route JIT through the baked libnvrtc.so.13. FP8 is still gated by config
+# (trainer fp8=true, inference quantization="fp8").
+ARG INSTALL_FP8=1
+ARG DEEP_GEMM_WHEEL=https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_gemm-2.5.0+891d57b-cp312-cp312-linux_x86_64.whl
+RUN if [ "$INSTALL_FP8" = "1" ]; then \
+        uv pip install --python /app/.venv/bin/python --no-cache-dir "${DEEP_GEMM_WHEEL}"; \
+        /app/.venv/bin/python -c "import deep_gemm; print('deep-gemm OK')" \
+            || echo "deep-gemm installed (import deferred: no GPU at build time)"; \
+    fi
+
+# --- Self-contained compiler toolchain (NII/Singularity: host tools are non-executable). ---
+# On the target cluster, ANY compiler resolved from a HOST path (inherited PATH, or a host CUDA
+# bound onto /usr/local/cuda) sits on a noexec mount -> torch.compile / JIT die with an uncaught
+# PermissionError on first cold compile. Every compiler must resolve to an IN-IMAGE binary at a
+# path Singularity WON'T bind. There are TWO independent resolution mechanisms, and both matter:
+#   * PATH-based (bare `nvcc`, deep-gemm): fronted by a wrapper /opt/opd/bin/nvcc that execs the
+#     venv's self-contained cu13 nvcc (its own ptxas/cicc/nvvm/headers; matches the deep-gemm cu13
+#     wheel via DG_JIT_NVCC_COMPILER).
+#   * CUDA_HOME-based (torch.utils.cpp_extension AND FlashInfer JIT — used inside vLLM inference):
+#     these NEVER consult PATH; they read CUDA_HOME and use $CUDA_HOME/bin/nvcc + headers + libs.
+#     The base sets CUDA_HOME=/usr/local/cuda (bind-shadowable), so the wrapper alone does NOT
+#     cover them. We therefore ship a FULL cu12.8 toolkit under /opt (unbindable) and point
+#     CUDA_HOME/CUDA_PATH at it -> torch+FlashInfer get a bind-safe, cu12.8-consistent (matches
+#     cu128 torch, no cu13 mix) nvcc/headers/libs.
+#   * gcc/g++/ld/as live in /usr/bin (image rootfs, never bind-shadowed) -> pinned via CC/CXX.
+# Host-fillable dirs (--nv's nvidia-smi, /usr/local/cuda/bin) go LAST on PATH so they can't shadow.
+RUN set -e; \
+    uv pip install --python /app/.venv/bin/python --no-cache-dir cmake; \
+    mkdir -p /opt/opd/bin; \
+    cp -a /usr/local/cuda-12.8 /opt/opd/cuda; \
+    NVCC="$(find /app/.venv -name nvcc -path '*nvidia*' -type f | head -1)"; test -n "$NVCC"; \
+    printf '#!/bin/sh\nexec %s "$@"\n' "$NVCC" > /opt/opd/bin/nvcc && chmod 0755 /opt/opd/bin/nvcc; \
+    # build-time smoke: BOTH bind-safe nvccs (cu12.8 toolkit for torch/FlashInfer, cu13 wrapper
+    # for deep-gemm) + in-image gcc actually compile CUDA (no GPU needed).
+    printf '__global__ void k(){}\nint main(){k<<<1,1>>>();return 0;}\n' > /tmp/_t.cu; \
+    /opt/opd/cuda/bin/nvcc -ccbin /usr/bin/gcc -arch=sm_90 /tmp/_t.cu -o /tmp/_t.out; \
+    /opt/opd/bin/nvcc -ccbin /usr/bin/gcc -arch=sm_90 /tmp/_t.cu -o /tmp/_t.out; \
+    rm -f /tmp/_t.cu /tmp/_t.out; \
+    echo "in-image cu12.8 + cu13 nvcc + gcc compile OK"
+
+ENV CUDA_HOME=/opt/opd/cuda \
+    CUDA_PATH=/opt/opd/cuda \
+    PATH=/opt/opd/cuda/bin:/opt/opd/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin \
+    CC=/usr/bin/gcc \
+    CXX=/usr/bin/g++ \
+    NVCC_PREPEND_FLAGS="-ccbin /usr/bin/gcc" \
+    DG_JIT_NVCC_COMPILER=/opt/opd/bin/nvcc
+
+# Verify torch + FlashInfer resolve the bind-safe CUDA_HOME (not the host-bindable /usr/local/cuda).
+RUN /app/.venv/bin/python -c "import os; from torch.utils.cpp_extension import CUDA_HOME as T; \
+import flashinfer.jit.env as fe; F=str(fe.cuda_home if hasattr(fe,'cuda_home') else os.environ['CUDA_HOME']); \
+assert T=='/opt/opd/cuda', ('torch CUDA_HOME',T); assert F.startswith('/opt/opd/cuda'), ('flashinfer CUDA_HOME',F); \
+print('bind-safe CUDA_HOME: torch=%s flashinfer=%s' % (T,F))"
