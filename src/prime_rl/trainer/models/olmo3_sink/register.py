@@ -49,4 +49,18 @@ def register_olmo3_sink(exist_ok: bool = True) -> None:
         )
     else:
         register_fa3_sink_attention()
+    # FA2 sink backend (`olmo3_sink_fa2`) for non-Hopper GPUs (Ampere/Blackwell) debug.
+    # Needs FA2 (`flash_attn`); tolerate its absence like the FA3 backend above.
+    try:
+        from .fa2_attention import register_fa2_sink_attention
+    except ModuleNotFoundError as e:
+        if e.name != "flash_attn":
+            raise
+        warnings.warn(
+            "olmo3_sink: FA2 (flash_attn) not available -- 'olmo3_sink_fa2' attention "
+            "backend NOT registered.",
+            stacklevel=2,
+        )
+    else:
+        register_fa2_sink_attention()
     _REGISTERED = True
