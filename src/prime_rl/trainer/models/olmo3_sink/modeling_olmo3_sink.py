@@ -169,12 +169,12 @@ class Olmo3SinkAttention(Olmo3Attention):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attn_impl = self.config._attn_implementation
-        if attn_impl not in {"eager", "olmo3_sink_fa3"}:
+        if attn_impl not in {"eager", "olmo3_sink_fa3", "olmo3_sink_fa2"}:
             raise ValueError(
                 "Olmo3Sink uses attention sinks (s_aux). Generic attention backends "
                 f"({attn_impl!r}) may silently ignore the sink argument. Load with "
-                "attn_implementation='olmo3_sink_fa3' for training, or 'eager' for "
-                "CPU/debug reference checks."
+                "attn_implementation='olmo3_sink_fa3' (Hopper), 'olmo3_sink_fa2' "
+                "(non-Hopper debug, e.g. sm_120), or 'eager' for a CPU/debug reference."
             )
 
         # Fallback (incl. attn_impl="eager") is our SINK-AWARE eager, not Olmo3's
@@ -315,7 +315,7 @@ class Olmo3SinkModel(Olmo3SinkPreTrainedModel, Olmo3Model):
         impl = self.config._attn_implementation or ""
         if (
             getattr(self.config, "reuse_packing_metadata", True)
-            and ("flash" in impl or impl == "olmo3_sink_fa3")
+            and ("flash" in impl or impl in ("olmo3_sink_fa3", "olmo3_sink_fa2"))
             and kwargs.get("cu_seq_lens_q") is None  # don't clobber model-provided varlen kwargs
             and _is_packed_sequence(position_ids, inputs_embeds.shape[0])
         ):
@@ -382,6 +382,16 @@ try:
     from .attention import register_fa3_sink_attention
 
     register_fa3_sink_attention()
+except Exception:  # noqa: BLE001
+    pass
+
+# Same for the FA2 sink backend (`attn_implementation="olmo3_sink_fa2"`), used to run the
+# sink on non-Hopper GPUs (Ampere/Blackwell) for debugging. Guarded: if FA2 (`flash_attn`)
+# isn't installed, import still succeeds and other backends remain usable.
+try:
+    from .fa2_attention import register_fa2_sink_attention
+
+    register_fa2_sink_attention()
 except Exception:  # noqa: BLE001
     pass
 
