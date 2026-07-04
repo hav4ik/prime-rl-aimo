@@ -255,6 +255,7 @@ def train(config: TrainerConfig):
         logger.info(f"Tracing to {config.trace_path}")
         prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
         maybe_record_function = record_function
+    is_first_step = True
     while True:
         # Reset peak memory stats
         torch.cuda.reset_peak_memory_stats()
@@ -765,6 +766,7 @@ def train(config: TrainerConfig):
         if is_last_step:
             break
         progress.step += 1
+        is_first_step = False
 
     if config.trace_path:
         prof.__exit__(None, None, None)
