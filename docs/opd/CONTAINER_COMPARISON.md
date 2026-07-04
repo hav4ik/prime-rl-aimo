@@ -72,3 +72,26 @@ cannot load the model, on any vLLM version.**
 Same roots (shared `prime-rl` main, same olmo3_sink), opposite build philosophies. Ours trades
 Nguyen's multi-engine/runtime-fetch flexibility for **reproducibility + an untouched official
 prime-rl**, in a single baked image with a crash-resilient remote-shell entrypoint.
+
+## Why Nguyen's 0.24 branch still runs — the nightly-vLLM speculation
+Nguyen's prime-rl `main` (`6ee9a5dc`) is on the **0.24 code** — `patches.py` hard-imports
+`vllm.parser.{qwen3,minimax_m2,engine}` (0.24-era modules) *and* the worker `ImportError` bug is
+present. Yet his multi-engine plugin loads. The likely reason: **he runs a vLLM *nightly*
+(`0.23.1rc1.dev699+gf5a8d7337`, built from vLLM `main` at `f5a8d733`).** Despite the `0.23.1rc1`
+version *string*, a nightly off vLLM `main` is typically **ahead of the 0.24 release branch point**,
+so it **already contains `vllm.parser.*`** — which makes the 0.24-era imports resolve. So the
+nightly sidesteps the *plugin-load* issue even though his branch is on 0.24 code. **(Speculation —
+not verified against the wheel's contents; the version string is misleading.)**
+
+Two caveats:
+- The nightly does **not** fix the worker `ImportError` — that's pure prime-rl code. His past W&B
+  runs avoided it by **predating the `6ee9a5dc` merge**, not via the nightly. His next OPD run on
+  current `main` will still hit it.
+- Running a nightly is exactly the **deviation from an official *released* vLLM** we chose to avoid.
+
+## Our resolution: `dev-vllm023` (stable 0.23, no nightly, no bugs)
+We branch from the fork's pre-0.24-merge state (`6ee9a5dc^1`) — **prime_rl 0.6.0 @ vLLM 0.23**,
+worker-consistent, **zero `vllm.parser` imports**, entry point (`transformers_v5_compat`) matching
+the base image's dist-info. On the stable 0.23 base it just works — no nightly, no `uv sync`, no
+worker fix. **Verified in `aimo-opd-sft:v2`:** plugin loads, worker package imports, olmo3_sink
+registers, olmo-core coexists in `/app/.venv` (rich 15, transformers 5.6.2, torch 2.11+cu128).
