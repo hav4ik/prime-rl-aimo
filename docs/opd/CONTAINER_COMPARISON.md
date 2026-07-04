@@ -95,3 +95,51 @@ worker-consistent, **zero `vllm.parser` imports**, entry point (`transformers_v5
 the base image's dist-info. On the stable 0.23 base it just works — no nightly, no `uv sync`, no
 worker fix. **Verified in `aimo-opd-sft:v2`:** plugin loads, worker package imports, olmo3_sink
 registers, olmo-core coexists in `/app/.venv` (rich 15, transformers 5.6.2, torch 2.11+cu128).
+
+## Round 2 — deep dependency + OPD-readiness comparison (2026-07-03)
+Deeper pass after inspecting Nguyen's build scripts (`install_training_deps.sh`,
+`install_modal_simp_extras.sh`, `train.py`, `train_engine_rl.py`) and our built `aimo-opd-sft:v2`.
+
+### BAKE vs FETCH (the core philosophy, crystallized)
+| | Ours (`aimo-opd-sft:v2`) | Nguyen's (`aimo-proof-pilot`) |
+|---|---|---|
+| **prime-rl** | **BAKED** (0.6.0 official, from `dev-vllm023`) | **runtime-fetched + pip-installed** (`nguyen599/prime-rl@main` → `/tmp/prime-rl-runtime`) |
+| **verifiers** | **BAKED** (0.1.15.dev411) | **runtime** (via fetched prime-rl deps) |
+| **proof_opd_env** | **git-pull to `/tmp/imochallenge/opd-env`** via baked `opd-env-sync` (PYTHONPATH; deps baked) | vendored in fetched prime-rl; standalone `src/proof_opd_env.py` is vf-eval-only |
+| runtime installs | **none** | prime-rl + verifiers + env deps at container start |
+
+### Full baked stack
+- **Ours (lean, 2 engines):** prime-rl (OPD) + olmo-core (SFT), verifiers, torch 2.11+cu128, vLLM
+  0.23.0+cu129, transformers 5.6.2, torchao 0.17, flash-attn 2/3/4, quack, liger, deep-gemm.
+  NO TransformerEngine, NO apex, NO Megatron, NO verl, NO open-instruct.
+- **Nguyen's (heavy multi-engine, cu130):** open-instruct + OLMo-core + Megatron + verl baked; TE
+  2.17dev, apex, flash-attn 2.8.3/3.0.0/4.0.0b15, liger, grouped_gemm, deep-ep, flashinfer 0.6.12,
+  ring-flash-attn, torchtitan, dion, mamba/causal-conv1d, deepspeed, bitsandbytes, peft, ray. vLLM
+  **cu130 dev nightly** (0.23.1rc1.dev699). transformers 5.8.1, torchao nightly. prime-rl NOT baked.
+
+### Can each run the OPD pipeline (proof_opd_env)?
+Both use prime-rl's **native OPD algorithm** (`orchestrator/algo/opd.py`, `[orchestrator.algo] type=opd`)
++ a **teacher model** (local vLLM teacher server, fp8).
+| Need | Ours | Nguyen's |
+|---|---|---|
+| prime-rl OPD algo | ✅ baked | ✅ runtime-fetched |
+| verifiers | ✅ baked | ⏳ runtime |
+| proof_opd_env | ✅ `opd-env-sync` (git-pull /tmp) | ✅ (in fetched prime-rl) |
+| teacher inference server | ✅ `prime_rl.entrypoints.inference` baked | ✅ |
+| olmo3_sink rollout model | ✅ registers (no worker bug) | ⚠️ **worker bug** on current main |
+| open_instruct (verifiable METRIC only) | ❌ absent (metric skipped; reward unaffected) | ✅ baked |
+
+### Differences that matter
+- **Nguyen runtime-installs prime-rl from `main` (`6ee9a5dc`) → the worker `ImportError` is live.** His
+  next OPD run on current main hits it. Ours bakes `dev-vllm023` → bug absent.
+- **TE gap:** Nguyen bakes TE 2.17dev; we dropped TE (torchao FP8 for SFT). But prime-rl-aimo has a lazy
+  `from transformer_engine.pytorch.optimizers import FusedAdam` (`trainer/optim.py:252`) → the **TE
+  FusedAdamW optimizer fails on our image**. The reference OPD operator command uses **Muon** (not
+  TE-AdamW), so this doesn't block the reference run — bake TE only if you want that optimizer.
+- **open_instruct** feeds only the verifiable-answer *metric* (not the reward), so its absence doesn't
+  affect OPD training — just drops one diagnostic on the ~20% verifiable rows.
+
+### Bottom line
+Ours = **lean, all-baked, official-stack, bug-free OPD core**, with the fast-changing env git-pulled to
+`/tmp`. Nguyen's = **heavy multi-engine, cu130, runtime-fetch everything** (incl. prime-rl, so it carries
+the live worker bug). For the OPD primary vehicle, ours is the lower-risk, reproducible choice.
