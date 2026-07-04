@@ -134,3 +134,31 @@ RUN /app/.venv/bin/python -c "import os; from torch.utils.cpp_extension import C
 import flashinfer.jit.env as fe; F=str(fe.cuda_home if hasattr(fe,'cuda_home') else os.environ['CUDA_HOME']); \
 assert T=='/opt/opd/cuda', ('torch CUDA_HOME',T); assert F.startswith('/opt/opd/cuda'), ('flashinfer CUDA_HOME',F); \
 print('bind-safe CUDA_HOME: torch=%s flashinfer=%s' % (T,F))"
+
+# --- Transformer Engine (enables the `te_fused_adamw` optimizer; `muon` also runs under FSDP2
+# without it, so this is an option, not a requirement). ---
+# No prebuilt TE wheel exists for torch 2.11+cu128 (NVIDIA ships torch2.10+cu128 and torch2.11+cu130
+# only), so transformer-engine-torch compiles from source (~2 min) against the bind-safe cu12.8
+# toolkit (CUDA_HOME=/opt/opd/cuda, set above) + torch's bundled cudnn/nccl headers (added to CPATH).
+#   * --no-deps: the metapackage AND transformer-engine-torch hard-depend on transformer-engine-cu13;
+#     --no-deps is the ONLY way to keep the install cu12-only (must match our cu128 torch). So we
+#     hand-install TE-torch's real runtime deps (onnx*/nvdlfw-inspect) + the build tools ourselves.
+#   * --no-build-isolation: the compile must link against the INSTALLED torch 2.11 (isolation pulls a
+#     mismatched torch and the build dies with a generic "Error compiling objects for extension").
+# ldconfig registers the venv's nvidia/*/lib so TE's core .so (dlopens libcublas.so.12 /
+# libcudnn_graph.so.9) resolves at runtime with no LD_LIBRARY_PATH (cu12 sonames don't collide with
+# the cu13 deep-gemm libs under /opt/cuda13). Build with --build-arg INSTALL_TE=0 to skip.
+ARG INSTALL_TE=1
+RUN if [ "$INSTALL_TE" = "1" ]; then set -e; \
+        SP=/app/.venv/lib/python3.12/site-packages; \
+        export CPATH="$SP/nvidia/cudnn/include:$SP/nvidia/nccl/include" \
+               LIBRARY_PATH="$SP/nvidia/cudnn/lib:$SP/nvidia/nccl/lib" \
+               MAX_JOBS="${MAX_JOBS:-16}" NVTE_FRAMEWORK=pytorch; \
+        uv pip install --python /app/.venv/bin/python --no-cache-dir \
+            setuptools wheel ninja pybind11 cmake onnx onnxscript onnx-ir nvdlfw-inspect; \
+        uv pip install --python /app/.venv/bin/python --no-cache-dir --no-deps --no-build-isolation \
+            transformer-engine==2.16.1 transformer-engine-cu12==2.16.1 transformer-engine-torch==2.16.1; \
+        for d in "$SP"/nvidia/*/lib; do echo "$d"; done > /etc/ld.so.conf.d/nvidia-venv.conf && ldconfig; \
+        /app/.venv/bin/python -c "from transformer_engine.pytorch.optimizers import FusedAdam; import transformer_engine as te; print('TE', te.__version__, 'FusedAdam OK')" \
+            || echo "TE compiled+installed (runtime import deferred: no GPU at build time)"; \
+    fi
