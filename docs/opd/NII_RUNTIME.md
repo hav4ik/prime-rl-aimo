@@ -39,3 +39,30 @@ The entrypoint runs the crash-resilient relay daemon (`/opt/venv-daemon`). Provi
 ## Secrets
 Pass `HF_TOKEN` / `WANDB_API_KEY` / `GITHUB_TOKEN` via the environment at runtime; never baked into the
 image.
+
+## Running the OPD operator command on our image
+Reference: `aimo-proof-pilot/operator_commands/prime_rl_opd_4xh200_muon_imo_...sh`. Our image doesn't
+bake Nguyen's `train.py` launcher, so:
+1. Pull the operator repo: `eval "$(opd-env-sync)"` → `/tmp/imochallenge/opd-env/aimo-proof-pilot`
+   (+ PYTHONPATH so `proof_opd_env` resolves).
+2. Stage model + data locally; point the operator env vars at them (`PRIME_OPD_MODEL_PATH`,
+   `PRIME_OPD_DATASET_PATH`, `PRIME_OPD_VERIFIABLE_DATASET_PATH`).
+3. Run the git-pulled `train.py` with OUR venv + fetch DISABLED (so it uses our baked, worker-bug-free
+   prime-rl instead of re-pulling nguyen599/main):
+   - `/app/.venv/bin/python $REPO/src/train.py` (not `/usr/bin/python /app/train.py`)
+   - replace `--fetch-update` with `--no-fetch-update --no-ensure-runtime-training-deps`
+4. Launch detached: `opd-run opd1 bash <edited-operator>.sh`; monitor via `opd-status` /
+   `tail -f /tmp/imochallenge/logs/opd1.log`.
+All other flags (muon, opd, teacher fp8, olmo3_sink_fa3, deepseek_v4, ulysses CP, fp8) are baked.
+
+## Checkpointing & disk
+prime-rl `CheckpointConfig` defaults (verified): **`interval=None`, `keep_last=None`, `keep_interval=None`**.
+- **The reference operator command sets no ckpt config → NO full checkpoints are written** (the loop
+  saves only when `config.ckpt.interval` is set AND `step % interval == 0`, `rl/train.py:303-305`).
+  Policy weights go to the rollout/teacher engine each step, but via NCCL/in-memory by default — not disk.
+- **If you enable checkpointing, retention is UNBOUNDED** (`keep_last=None` → keep all). Set `keep_last`
+  (e.g. 2–3) or the disk fills.
+- **Sizing (32B):** image ~22.5 GB; model bf16 ~64 GB (fp8 ~32 GB; +64 GB if pulled via HF cache instead
+  of a local path); caches ~10–20 GB; **each full checkpoint ~200–450 GB** (bf16 weights + fp32 optimizer
+  state). Budget ~150 GB for a smoke run, ~1 TB for real training with checkpoints. Stage the model as a
+  LOCAL path and checkpoint to a MOUNTED volume (not container `/tmp`).

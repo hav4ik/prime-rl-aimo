@@ -143,3 +143,26 @@ Both use prime-rl's **native OPD algorithm** (`orchestrator/algo/opd.py`, `[orch
 Ours = **lean, all-baked, official-stack, bug-free OPD core**, with the fast-changing env git-pulled to
 `/tmp`. Nguyen's = **heavy multi-engine, cu130, runtime-fetch everything** (incl. prime-rl, so it carries
 the live worker bug). For the OPD primary vehicle, ours is the lower-risk, reproducible choice.
+
+## Known issues in Nguyen's container (to report upstream)
+Feedback for `nguyen599/aimo-proof-pilot`, most-severe first:
+1. **[CRITICAL — the vLLM rollout issue] Worker `ImportError`.** `src/prime_rl/inference/vllm/worker/
+   __init__.py` imports `monkey_patch_skip_lora_module_warnings` and calls
+   `monkey_patch_LRUCacheWorkerLoRAManager()` — both DELETED from `patches.py` by upstream `6836d325c`
+   (vLLM 0.24 native inplace-load). The 0.24-sync merge `6ee9a5dc` kept the calls. Importing the vLLM
+   worker package raises `ImportError` → the rollout worker dies → `Olmo3SinkForCausalLM` never
+   registers → **OPD rollout can't load the model.** Version-independent; it's in his `main` now. His
+   working W&B runs PREDATE the merge; the next run on current main hits it. **Fix: drop the 2 stale
+   calls + the dangling import** (finishes upstream's 0.24 refactor).
+2. **`--fetch-update` re-installs the buggy main.** `train.py` default fetches `nguyen599/prime-rl@main`
+   (= `6ee9a5dc`) and pip-installs it each run — so even a local fix is overwritten unless a good ref is
+   pinned. And on a read-only FS (NII) the runtime pip-install into site-packages fails outright.
+3. **cu130 + vLLM dev nightly.** The stack deviates from official prime-rl (cu128 + released vLLM 0.24):
+   he runs `vllm 0.23.1rc1.dev699+cu130` (a dev nightly). Non-reproducible + exposed to nightly
+   regressions on the primary vehicle.
+4. **Checkpointing off + unbounded retention.** prime-rl `CheckpointConfig.interval=None` (no ckpts) and
+   `keep_last=None` (keep all). Real runs need an interval + `keep_last` set, or nothing is saved / disk
+   fills (~200–450 GB per 32B checkpoint).
+5. **(minor) proof_opd_env source of truth.** The standalone `src/proof_opd_env.py` is documented as
+   vf-eval-only; the env actually used comes from the runtime-fetched prime-rl fork. Clarify which is
+   authoritative to avoid drift.
